@@ -14,7 +14,14 @@ const config = JSON.parse(read(path.join(repoRoot, ".vault-meta", "config.json")
 const detailedDaily = config.dailySummaryDetail !== "concise";
 
 const dailyFields = ["date", "lookup_keys", "confidence", "contains_vault_answer"];
+// Forward-reference policy. SCHEMA.md "Forward References" owns the rule; these are
+// the only places the numbers live.
+const FORWARD_REFERENCE_PROMOTION_THRESHOLD = 2;
+const FORWARD_REFERENCE_STALE_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const dailyFilePattern = /^\d{4}-\d{2}-\d{2}\.md$/;
 const issues = [];
+const forwardReferenceSightings = new Map();
 const stats = { dailyPages: 0, concepts: 0, wikiFiles: 0, promotedRules: 0 };
 
 function relative(file) {
@@ -154,6 +161,23 @@ function extractWikilinks(text) {
     .filter(Boolean);
 }
 
+function lintDate() {
+  // LLM_WIKI_NOW (YYYY-MM-DD or ISO timestamp) makes stale detection deterministic.
+  const raw = process.env.LLM_WIKI_NOW;
+  const parsed = raw ? new Date(raw) : new Date();
+  if (Number.isNaN(parsed.getTime())) throw new Error(`Invalid LLM_WIKI_NOW: ${raw}`);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function isDailyPage(file) {
+  return path.dirname(relative(file)) === "wiki/sources/ai-chats" && dailyFilePattern.test(path.basename(file));
+}
+
+function forwardReferenceTarget(link) {
+  const clean = link.replace(/^wiki\//, "").replace(/^\/+/, "");
+  return /^concepts\/[^/]+$/.test(clean) ? clean : "";
+}
+
 function resolveLink(target, pages) {
   const clean = target.replace(/^wiki\//, "").replace(/^\/+/, "");
   return pages.get(clean) || pages.get(path.basename(clean));
@@ -161,7 +185,7 @@ function resolveLink(target, pages) {
 
 function checkDailyPages() {
   const dir = path.join(wikiRoot, "sources", "ai-chats");
-  const files = listMarkdown(dir).filter((file) => /^\d{4}-\d{2}-\d{2}\.md$/.test(path.basename(file)));
+  const files = listMarkdown(dir).filter((file) => dailyFilePattern.test(path.basename(file)));
   stats.dailyPages = files.length;
 
   for (const file of files) {
@@ -268,11 +292,49 @@ function checkDailyPages() {
 
 function checkWikilinks(files, pages) {
   for (const file of files) {
-    for (const link of extractWikilinks(read(file))) {
-      const target = resolveLink(link, pages);
-      if (!target) add("error", "broken-wikilink", file, `Broken wikilink: [[${link}]].`);
+    const text = read(file);
+    const daily = isDailyPage(file);
+    const reported = new Set();
+    for (const link of extractWikilinks(text)) {
+      if (resolveLink(link, pages)) continue;
+      const forwardTarget = daily ? forwardReferenceTarget(link) : "";
+      if (!forwardTarget) {
+        add("error", "broken-wikilink", file, `Broken wikilink: [[${link}]].`);
+        continue;
+      }
+      if (reported.has(forwardTarget)) continue;
+      reported.add(forwardTarget);
+      add("info", "forward-reference", file, `Forward reference to missing Concept: [[${forwardTarget}]].`);
+      const containsVaultAnswer = String(parseFrontmatter(text).fields.get("contains_vault_answer") || "").trim() === "true";
+      const sightings = forwardReferenceSightings.get(forwardTarget) || [];
+      sightings.push({ date: path.basename(file, ".md"), containsVaultAnswer });
+      forwardReferenceSightings.set(forwardTarget, sightings);
     }
   }
+}
+
+function summarizeForwardReferences(asOf) {
+  const asOfMs = Date.parse(`${asOf}T00:00:00Z`);
+  return [...forwardReferenceSightings.entries()]
+    .map(([target, sightings]) => {
+      const dates = sightings.map((sighting) => sighting.date).sort();
+      const independentCount = sightings.filter((sighting) => !sighting.containsVaultAnswer).length;
+      const firstSeen = dates[0];
+      const lastSeen = dates[dates.length - 1];
+      const ageDays = Math.floor((asOfMs - Date.parse(`${lastSeen}T00:00:00Z`)) / DAY_MS);
+      const candidate = independentCount >= FORWARD_REFERENCE_PROMOTION_THRESHOLD;
+      return {
+        target,
+        referencingDailies: dates,
+        vaultDerivedDailies: sightings.filter((sighting) => sighting.containsVaultAnswer).map((sighting) => sighting.date).sort(),
+        independentCount,
+        firstSeen,
+        lastSeen,
+        candidate,
+        stale: !candidate && ageDays > FORWARD_REFERENCE_STALE_DAYS,
+      };
+    })
+    .sort((a, b) => b.independentCount - a.independentCount || a.target.localeCompare(b.target));
 }
 
 function checkConcepts() {
@@ -312,7 +374,24 @@ function checkCoreFiles() {
   }
 }
 
-function renderMarkdown() {
+function renderForwardReferences(forwardReferences, asOf) {
+  const lines = [
+    "## Forward References",
+    "",
+    `Promotion candidate: independentCount >= ${FORWARD_REFERENCE_PROMOTION_THRESHOLD}. Stale: below threshold and last referenced more than ${FORWARD_REFERENCE_STALE_DAYS} days before ${asOf}. This list is a Reconcile signal only; see SCHEMA.md.`,
+    "",
+  ];
+  if (forwardReferences.length === 0) return [...lines, "- None", ""];
+  for (const entry of forwardReferences) {
+    const status = entry.candidate ? "promotion candidate" : entry.stale ? "stale" : "pending";
+    const derived = entry.vaultDerivedDailies.length ? `; vault-derived (not counted): ${entry.vaultDerivedDailies.join(", ")}` : "";
+    lines.push(`- [[${entry.target}]] — ${status}; independentCount: ${entry.independentCount}; firstSeen: ${entry.firstSeen}; lastSeen: ${entry.lastSeen}; stale: ${entry.stale}; referencingDailies: ${entry.referencingDailies.join(", ")}${derived}`);
+  }
+  lines.push("");
+  return lines;
+}
+
+function renderMarkdown(forwardReferences, asOf) {
   const groups = Object.fromEntries(["error", "warning", "info"].map((severity) => [
     severity,
     issues.filter((issue) => issue.severity === severity),
@@ -327,6 +406,7 @@ function renderMarkdown() {
     "",
     `- Errors: ${groups.error.length}`,
     `- Warnings: ${groups.warning.length}`,
+    `- Forward references: ${forwardReferences.length}`,
     `- Daily pages: ${stats.dailyPages}`,
     `- Concepts: ${stats.concepts}`,
     `- Promoted behavior rules: ${stats.promotedRules}/10`,
@@ -343,12 +423,14 @@ function renderMarkdown() {
       lines.push("");
     }
   }
+  lines.push(...renderForwardReferences(forwardReferences, asOf));
   lines.push(
     "## Reconcile Notes",
     "",
     "- Fix deterministic errors before promotion work.",
     "- Apply the provenance and promotion rules from SCHEMA.md.",
     "- For insufficient or disputed evidence, inspect a linked Capture Card before the original session.",
+    "- Forward-reference candidates never promote themselves; log every promote / merge / drop decision in wiki/log.md.",
     "",
   );
   return `${lines.join("\n").trimEnd()}\n`;
@@ -367,8 +449,21 @@ function main() {
     checkBehaviorRules();
   }
 
-  const report = { generatedAt: new Date().toISOString(), repoRoot, stats, issues };
-  fs.writeFileSync(markdownReportPath, renderMarkdown());
+  const asOf = lintDate();
+  const forwardReferences = summarizeForwardReferences(asOf);
+  const report = {
+    generatedAt: new Date().toISOString(),
+    repoRoot,
+    stats,
+    issues,
+    forwardReferencePolicy: {
+      promotionThreshold: FORWARD_REFERENCE_PROMOTION_THRESHOLD,
+      staleWindowDays: FORWARD_REFERENCE_STALE_DAYS,
+      asOf,
+    },
+    forwardReferences,
+  };
+  fs.writeFileSync(markdownReportPath, renderMarkdown(forwardReferences, asOf));
   fs.writeFileSync(jsonReportPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`Wrote ${relative(markdownReportPath)}`);
   console.log(`Errors: ${issues.filter((issue) => issue.severity === "error").length}, warnings: ${issues.filter((issue) => issue.severity === "warning").length}`);

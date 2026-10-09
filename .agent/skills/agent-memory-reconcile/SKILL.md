@@ -19,9 +19,13 @@ and ticket ids in English. This workflow is periodic maintenance, not a weekly r
 5. Fix deterministic errors before making judgment calls.
 6. Apply the concept, promotion, provenance, and rule-cap definitions from
    `SCHEMA.md`; update existing knowledge before creating parallel pages.
-7. Do not modify `wiki/guardrails/Agent Behavior Rules.md`; this repository consumes
+7. Treat the lint report's `Forward References` section as a candidate queue only,
+   as defined in `SCHEMA.md` "Forward References". A promotion candidate or `stale`
+   flag is a signal, never a decision; reaching the threshold does not create a
+   Concept. Log every promote, merge, or drop decision in `wiki/log.md`.
+8. Do not modify `wiki/guardrails/Agent Behavior Rules.md`; this repository consumes
    reviewed Concepts and does not generate behavior rules.
-8. Append a concise audit entry to
+9. Append a concise audit entry to
    `.vault-meta/reviews/Agent Memory Reconcile Reviews.md` and an operation entry to
    `wiki/log.md`.
 
@@ -52,6 +56,7 @@ knowledge only to merge, update, or avoid duplication.
 - Lint completed and its Markdown report was read.
 - New or updated concepts link to Daily evidence.
 - Provenance, promotion, and rule-cap decisions follow `SCHEMA.md`.
+- Each forward-reference promote, merge, or drop decision is logged in `wiki/log.md`.
 - The review was freshly derived from the current Daily window rather than copied
   from a prior agent run.
 - The reconcile audit and `wiki/log.md` state what changed, what was skipped, and any

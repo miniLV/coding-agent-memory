@@ -113,6 +113,9 @@ returns one metadata JSON line containing its path; it never emits Snapshot byte
   detail and do not open another source.
 - `detailed` preserves all valuable supported information in the Snapshot.
   `concise` shortens prose, not factual accuracy.
+- When a reusable idea has no Concept yet, you may write a forward reference
+  `[[concepts/<Name>]]` as defined in `SCHEMA.md` "Forward References". Never create
+  the Concept page and never link other missing targets.
 - A day with no substantive work may be `skipped_with_reason: no high-signal work`
   instead of producing an empty Daily.
 

@@ -73,7 +73,8 @@ counts, and per-item provenance labels.
 - core files exist;
 - Daily frontmatter and section shape match `SCHEMA.md`;
 - every Daily key topic links exact Evidence Cards from its dated Evidence Snapshot;
-- wikilinks resolve;
+- wikilinks resolve, except Daily forward references to missing Concepts, which are
+  reported as `info` and aggregated as Reconcile candidates (rule in `SCHEMA.md`);
 - Concepts have visible Daily evidence;
 
 Content quality, contradiction resolution, promotion value, and demotion remain LLM

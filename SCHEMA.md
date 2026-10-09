@@ -117,6 +117,28 @@ repo, and it does not merely restate `SCHEMA.md`, a skill, README, or an existin
 Concept. Self-referential workflow output is backup evidence, not independent
 promotion evidence.
 
+### Forward References
+
+A Daily page may link a Concept that does not exist yet as `[[concepts/<Name>]]`.
+This forward reference keeps a recurring candidate visible without bypassing
+Reconcile. It is legal only from `wiki/sources/ai-chats/YYYY-MM-DD.md` and only
+toward `concepts/`; every other unresolved wikilink remains a lint error.
+
+Lint reports each forward reference as `info` and aggregates targets in the
+`Forward References` report section (`forwardReferences` in JSON) with the
+referencing dates, `firstSeen`, `lastSeen`, and `independentCount`. Each Daily
+counts at most once per target, and Daily pages with `contains_vault_answer: true`
+are listed but not counted, following the anti-echo rule above. A target reaching
+the promotion threshold (2 independent Daily pages) is a promotion candidate; a
+target below the threshold whose latest reference is more than 30 days old is
+`stale`. The numbers are single constants in `scripts/wiki-lint.mjs`.
+
+The candidate list is a signal only. Reaching the threshold never creates a
+Concept; Reconcile still applies the promotion rule above. Reconcile promotes by
+creating `concepts/<Name>.md`, which resolves the links; merges by rewriting the
+Daily links to the existing Concept; or drops by removing the brackets. Every
+promote, merge, or drop decision is logged in `wiki/log.md`.
+
 `wiki/guardrails/Agent Behavior Rules.md` is retained as a compatibility placeholder.
 This repository does not generate behavior rules; Reconcile writes Concepts only.
 
@@ -128,7 +150,7 @@ remains canonical.
 
 - Daily writes one dated page and appends `wiki/log.md`.
 - Reconcile runs deterministic lint, then may update reviewed concepts and
-  `wiki/log.md`. It does not create behavior rules or a weekly summary layer.
+  `wiki/log.md`. Resolving a forward reference may also rewrite its Daily link. It does not create behavior rules or a weekly summary layer.
 - `wiki/index.md` is stable routing documentation, not a growing key database.
 - Query lists or exact-searches Daily and concept files at runtime. Current-state
   and date-range questions may use Daily pages as historical evidence. Reusable

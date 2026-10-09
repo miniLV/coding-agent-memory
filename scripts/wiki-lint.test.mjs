@@ -405,3 +405,174 @@ test("wiki lint treats the empty starter as non-failing", () => {
   assert.equal(json.stats.concepts, 0);
   assert.equal("canvases" in json.stats, false);
 });
+
+function seedDaily(root, { date, body, containsVaultAnswer = false }) {
+  const id = `codex-${date.replaceAll("-", "")}`;
+  write(
+    path.join(root, ".vault-meta", "captures", "ai-chats", `${date}.capture.json`),
+    captureCard({ date, id, containsVaultAnswer }),
+  );
+  write(
+    path.join(root, "wiki", "sources", "ai-chats", `${date}.md`),
+    `---
+date: ${date}
+lookup_keys: []
+confidence: medium
+contains_vault_answer: ${containsVaultAnswer}
+---
+
+## 摘要
+
+- 调查完成。
+
+## 关键会话
+
+### Verification
+
+${evidenceLink(date, id)}
+
+- 验证通过。
+
+## 可复用经验
+
+${body}
+`,
+  );
+}
+
+function runLintAt(root, now, strict = false) {
+  const previous = process.env.LLM_WIKI_NOW;
+  process.env.LLM_WIKI_NOW = now;
+  try {
+    return runLint(root, strict);
+  } finally {
+    if (previous === undefined) delete process.env.LLM_WIKI_NOW;
+    else process.env.LLM_WIKI_NOW = previous;
+  }
+}
+
+function forwardRefRoot(prefix) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  seedCore(tmp);
+  write(path.join(tmp, ".vault-meta", "config.json"), '{"dailySummaryDetail":"concise"}\n');
+  return tmp;
+}
+
+test("wiki lint reports a Daily link to a missing Concept as an info forward reference", () => {
+  const tmp = forwardRefRoot("wiki-lint-forward-");
+  seedDaily(tmp, { date: "2026-08-01", body: "- 先验证运行产物。[[concepts/Runtime Artifact Verification]]" });
+
+  const { report, json } = runLintAt(tmp, "2026-08-02", true);
+  assert.equal(json.issues.filter((issue) => issue.severity === "error").length, 0);
+  const info = json.issues.filter((issue) => issue.code === "forward-reference");
+  assert.equal(info.length, 1);
+  assert.equal(info[0].severity, "info");
+  assert.equal(info[0].file, "wiki/sources/ai-chats/2026-08-01.md");
+  assert.deepEqual(json.forwardReferences, [{
+    target: "concepts/Runtime Artifact Verification",
+    referencingDailies: ["2026-08-01"],
+    vaultDerivedDailies: [],
+    independentCount: 1,
+    firstSeen: "2026-08-01",
+    lastSeen: "2026-08-01",
+    candidate: false,
+    stale: false,
+  }]);
+  assert.deepEqual(json.forwardReferencePolicy, { promotionThreshold: 2, staleWindowDays: 30, asOf: "2026-08-02" });
+  assert.match(report, /## Forward References/);
+  assert.match(report, /\[\[concepts\/Runtime Artifact Verification\]\] — pending; independentCount: 1; firstSeen: 2026-08-01; lastSeen: 2026-08-01; stale: false/);
+});
+
+test("wiki lint keeps unresolved links outside the Daily-to-Concept forward-reference rule as errors", () => {
+  const tmp = forwardRefRoot("wiki-lint-forward-illegal-");
+  seedDaily(tmp, { date: "2026-08-01", body: "- 非 Concept 目标。[[Missing Page]] [[guardrails/Missing Rule]]" });
+  write(path.join(tmp, "wiki", "concepts", "Existing.md"), "# Existing\n\nEvidence: [[sources/ai-chats/2026-08-01]] [[concepts/Not Yet Written]]\n");
+  write(path.join(tmp, "wiki", "index.md"), "# Engineering Memory Index\n\n[[concepts/Index Target]]\n");
+  write(path.join(tmp, "wiki", "log.md"), "# Operation Log\n\n[[concepts/Log Target]]\n");
+  write(path.join(tmp, "wiki", "guardrails", "Agent Behavior Rules.md"), "# Agent Behavior Rules\n\nNo promoted rules yet. [[concepts/Rule Target]]\n");
+
+  const { json } = runLintAt(tmp, "2026-08-02");
+  const broken = json.issues.filter((issue) => issue.code === "broken-wikilink");
+  assert.ok(broken.every((issue) => issue.severity === "error"));
+  assert.deepEqual(broken.map((issue) => `${issue.file} ${issue.message}`).sort(), [
+    "wiki/concepts/Existing.md Broken wikilink: [[concepts/Not Yet Written]].",
+    "wiki/guardrails/Agent Behavior Rules.md Broken wikilink: [[concepts/Rule Target]].",
+    "wiki/index.md Broken wikilink: [[concepts/Index Target]].",
+    "wiki/log.md Broken wikilink: [[concepts/Log Target]].",
+    "wiki/sources/ai-chats/2026-08-01.md Broken wikilink: [[Missing Page]].",
+    "wiki/sources/ai-chats/2026-08-01.md Broken wikilink: [[guardrails/Missing Rule]].",
+  ]);
+  assert.equal(json.forwardReferences.length, 0);
+  assert.throws(() => runLintAt(tmp, "2026-08-02", true));
+});
+
+test("wiki lint counts repeated forward references from one Daily once", () => {
+  const tmp = forwardRefRoot("wiki-lint-forward-dupe-");
+  seedDaily(tmp, {
+    date: "2026-08-01",
+    body: "- 第一次。[[concepts/Pattern A]]\n- 第二次。[[concepts/Pattern A|别名]]\n- 第三次。[[concepts/Pattern A#Heading]]",
+  });
+
+  const { json } = runLintAt(tmp, "2026-08-02", true);
+  assert.equal(json.issues.filter((issue) => issue.code === "forward-reference").length, 1);
+  assert.equal(json.forwardReferences.length, 1);
+  assert.deepEqual(json.forwardReferences[0].referencingDailies, ["2026-08-01"]);
+  assert.equal(json.forwardReferences[0].independentCount, 1);
+});
+
+test("wiki lint lists vault-derived Dailies but excludes them from independentCount", () => {
+  const tmp = forwardRefRoot("wiki-lint-forward-derived-");
+  seedDaily(tmp, { date: "2026-08-01", body: "- 独立证据。[[concepts/Pattern B]]" });
+  seedDaily(tmp, { date: "2026-08-03", body: "- 来自 vault 答案。[[concepts/Pattern B]]", containsVaultAnswer: true });
+
+  const { json } = runLintAt(tmp, "2026-08-04", true);
+  const [entry] = json.forwardReferences;
+  assert.deepEqual(entry.referencingDailies, ["2026-08-01", "2026-08-03"]);
+  assert.deepEqual(entry.vaultDerivedDailies, ["2026-08-03"]);
+  assert.equal(entry.independentCount, 1);
+  assert.equal(entry.candidate, false);
+  assert.equal(entry.firstSeen, "2026-08-01");
+  assert.equal(entry.lastSeen, "2026-08-03");
+});
+
+test("wiki lint marks a forward reference as a promotion candidate at the threshold", () => {
+  const tmp = forwardRefRoot("wiki-lint-forward-threshold-");
+  seedDaily(tmp, { date: "2026-08-01", body: "- 工作流一。[[concepts/Pattern C]]" });
+  seedDaily(tmp, { date: "2026-08-05", body: "- 工作流二。[[concepts/Pattern C]]" });
+  seedDaily(tmp, { date: "2026-08-06", body: "- 只有一次。[[concepts/Pattern D]]" });
+
+  const { report, json } = runLintAt(tmp, "2026-08-07", true);
+  const byTarget = Object.fromEntries(json.forwardReferences.map((entry) => [entry.target, entry]));
+  assert.equal(byTarget["concepts/Pattern C"].independentCount, 2);
+  assert.equal(byTarget["concepts/Pattern C"].candidate, true);
+  assert.equal(byTarget["concepts/Pattern D"].candidate, false);
+  assert.equal(json.forwardReferences[0].target, "concepts/Pattern C");
+  assert.match(report, /\[\[concepts\/Pattern C\]\] — promotion candidate; independentCount: 2/);
+  assert.equal(fs.existsSync(path.join(tmp, "wiki", "concepts")), false, "lint must never create Concepts");
+});
+
+test("wiki lint marks below-threshold forward references stale after the window", () => {
+  const tmp = forwardRefRoot("wiki-lint-forward-stale-");
+  seedDaily(tmp, { date: "2026-07-01", body: "- 旧想法。[[concepts/Old Idea]]" });
+  seedDaily(tmp, { date: "2026-07-02", body: "- 旧但已达阈值。[[concepts/Old Candidate]]" });
+  seedDaily(tmp, { date: "2026-07-03", body: "- 旧但已达阈值。[[concepts/Old Candidate]]" });
+
+  const atBoundary = runLintAt(tmp, "2026-07-31").json;
+  assert.equal(atBoundary.forwardReferences.find((entry) => entry.target === "concepts/Old Idea").stale, false);
+
+  const { report, json } = runLintAt(tmp, "2026-08-01", true);
+  const byTarget = Object.fromEntries(json.forwardReferences.map((entry) => [entry.target, entry]));
+  assert.equal(byTarget["concepts/Old Idea"].stale, true);
+  assert.equal(byTarget["concepts/Old Candidate"].stale, false);
+  assert.match(report, /\[\[concepts\/Old Idea\]\] — stale;/);
+});
+
+test("wiki lint resolves a forward reference once the Concept exists", () => {
+  const tmp = forwardRefRoot("wiki-lint-forward-resolved-");
+  seedDaily(tmp, { date: "2026-08-01", body: "- 已晋升。[[concepts/Promoted Pattern]]" });
+  write(path.join(tmp, "wiki", "concepts", "Promoted Pattern.md"), "# Promoted Pattern\n\nEvidence: [[sources/ai-chats/2026-08-01]]\n");
+
+  const { json } = runLintAt(tmp, "2026-08-02", true);
+  assert.equal(json.issues.length, 0);
+  assert.deepEqual(json.forwardReferences, []);
+});
